@@ -33,8 +33,8 @@ BOT_NAME = os.environ.get("BOT_NAME", "Aero Contact Relay")
 BOT_VERSION = os.environ.get("BOT_VERSION", "v3.2")
 
 UPDATES_URL = os.environ.get("UPDATES_CHANNEL_URL", "https://t.me/Aero_Unity")
-REPO_URL = os.environ.get("REPO_URL", "https://github.com/MohammedDev-yt")
-DEPLOY_STATUS_URL = os.environ.get("DEPLOY_STATUS_URL", "https://render.com")
+REPO_URL = os.environ.get("REPO_URL", "https://t.me/Aero_Unity")
+DEPLOY_STATUS_URL = os.environ.get("DEPLOY_STATUS_URL", "https://t.me/Aero_Unity")
 PYROGRAM_URL = os.environ.get("PYROGRAM_URL", "https://docs.pyrogram.org")
 PYTHON_URL = os.environ.get("PYTHON_URL", "https://www.python.org")
 PORT = int(os.environ.get("PORT", 8080))
@@ -117,11 +117,11 @@ async def is_ai_enabled() -> bool:
 def start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📢 Updates", url=UPDATES_URL),
-            InlineKeyboardButton("❓ Help", callback_data="help_menu"),
+            InlineKeyboardButton("• Updates •", url=UPDATES_URL),
+            InlineKeyboardButton("• Help •", callback_data="help_menu"),
         ],
         [
-            InlineKeyboardButton("ℹ️ About", callback_data="about_menu"),
+            InlineKeyboardButton("• About •", callback_data="about_menu"),
         ],
     ])
 
@@ -138,14 +138,14 @@ def build_start_text(user, owner_meta: str = "") -> str:
     if owner_meta:
         return (
             f"<blockquote>"
-            f"<b>Hey {greeting}, welcome!</b>\n"
+            f"<b>Hey {greeting}, welcome!</b>\n\n"
             f"<b>{owner_meta}</b>\n"
             f"<b>Commands: /ai on|off • /block • /unblock &lt;id&gt; • /stats • /broadcast</b>"
             f"</blockquote>"
         )
     return (
         f"<blockquote>"
-        f"<b>Hey {greeting}, welcome!</b>\n"
+        f"<b>Hey {greeting}, welcome!</b>\n\n"
         f"<b>Drop your message below and it will be sent directly to the owner.</b>"
         f"</blockquote>"
     )
@@ -166,7 +166,7 @@ def build_about_text() -> str:
         f"<b>Bot name: <a href='{UPDATES_URL}'>{BOT_NAME}</a></b>\n"
         f"<b>Library: <a href='{PYROGRAM_URL}'>Pyrogram</a></b>\n"
         f"<b>Language: <a href='{PYTHON_URL}'>Python</a></b>\n"
-        f"<b>Updates: <a href='{UPDATES_URL}'>Updates Channel</a></b>\n"
+        f"<b>Updates: <a href='{UPDATES_URL}'>Aero Unity</a></b>\n"
         f"<b>Build status: <a href='{DEPLOY_STATUS_URL}'>Active (24/7)</a></b>\n"
         f"<b>Version: <a href='{REPO_URL}'>{BOT_VERSION}</a></b>"
         "</blockquote>"
