@@ -12,6 +12,7 @@ from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
+    InputMediaPhoto,
 )
 from pyrogram.errors import UserIsBlocked
 from google import genai
@@ -26,8 +27,16 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "123456789"))
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majority")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "your_gemini_api_key_here")
 
+# Add your start image URL here or via START_IMAGE_URL env var
+START_IMAGE_URL = os.environ.get("START_IMAGE_URL", "")
+BOT_NAME = os.environ.get("BOT_NAME", "Aero Contact Relay")
+BOT_VERSION = os.environ.get("BOT_VERSION", "v3.2")
+
 UPDATES_URL = os.environ.get("UPDATES_CHANNEL_URL", "https://t.me/Aero_Unity")
-OWNER_URL = os.environ.get("OWNER_URL", "https://t.me/Mr_Mohammed_29")
+REPO_URL = os.environ.get("REPO_URL", "https://github.com/MohammedDev-yt")
+DEPLOY_STATUS_URL = os.environ.get("DEPLOY_STATUS_URL", "https://render.com")
+PYROGRAM_URL = os.environ.get("PYROGRAM_URL", "https://docs.pyrogram.org")
+PYTHON_URL = os.environ.get("PYTHON_URL", "https://www.python.org")
 PORT = int(os.environ.get("PORT", 8080))
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -82,6 +91,9 @@ def format_user_greeting(user) -> str:
         return f"@{user.username}"
     return user.first_name or "there"
 
+def has_start_image() -> bool:
+    return bool(START_IMAGE_URL and START_IMAGE_URL.strip().startswith(("http://", "https://")))
+
 async def save_user(user):
     await users_col.update_one(
         {"user_id": user.id},
@@ -106,28 +118,104 @@ def start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📢 Updates", url=UPDATES_URL),
-            InlineKeyboardButton("❓ Help", callback_data="help_info"),
+            InlineKeyboardButton("❓ Help", callback_data="help_menu"),
         ],
         [
-            InlineKeyboardButton("👑 Owner", url=OWNER_URL),
+            InlineKeyboardButton("ℹ️ About", callback_data="about_menu"),
         ],
     ])
 
-# ==========================================
-# CALLBACK HANDLER (Help Button)
-# ==========================================
-@app.on_callback_query(filters.regex("^help_info$"))
-async def help_callback(client: Client, callback_query: CallbackQuery):
-    help_text = (
+def panel_nav_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏠 Home", callback_data="home_menu"),
+            InlineKeyboardButton("❌ Close", callback_data="close_menu"),
+        ]
+    ])
+
+def build_start_text(user, owner_meta: str = "") -> str:
+    greeting = format_user_greeting(user)
+    if owner_meta:
+        return (
+            f"<blockquote>"
+            f"<b>Hey {greeting}, welcome!</b>\n"
+            f"<b>{owner_meta}</b>\n"
+            f"<b>Commands: /ai on|off • /block • /unblock &lt;id&gt; • /stats • /broadcast</b>"
+            f"</blockquote>"
+        )
+    return (
+        f"<blockquote>"
+        f"<b>Hey {greeting}, welcome!</b>\n"
+        f"<b>Drop your message below and it will be sent directly to the owner.</b>"
+        f"</blockquote>"
+    )
+
+def build_help_text() -> str:
+    return (
         "<blockquote>"
         "<b>How to use this bot</b>\n"
-        "• Send any text, photo, video, voice, or document.\n"
-        "• Your message is forwarded straight to the owner.\n"
-        "• When the owner replies, you will receive their message here."
+        "<b>• Send any text, photo, video, voice, or document.</b>\n"
+        "<b>• Your message is forwarded straight to the owner.</b>\n"
+        "<b>• When the owner replies, you will receive their message here.</b>"
         "</blockquote>"
     )
+
+def build_about_text() -> str:
+    return (
+        "<blockquote>"
+        f"<b>Bot name: <a href='{UPDATES_URL}'>{BOT_NAME}</a></b>\n"
+        f"<b>Library: <a href='{PYROGRAM_URL}'>Pyrogram</a></b>\n"
+        f"<b>Language: <a href='{PYTHON_URL}'>Python</a></b>\n"
+        f"<b>Updates: <a href='{UPDATES_URL}'>Updates Channel</a></b>\n"
+        f"<b>Build status: <a href='{DEPLOY_STATUS_URL}'>Active (24/7)</a></b>\n"
+        f"<b>Version: <a href='{REPO_URL}'>{BOT_VERSION}</a></b>"
+        "</blockquote>"
+    )
+
+async def send_or_edit_panel(callback_query: CallbackQuery, text: str, reply_markup: InlineKeyboardMarkup):
+    msg = callback_query.message
+    if msg.photo:
+        await msg.edit_caption(caption=text, reply_markup=reply_markup)
+    else:
+        await msg.edit_text(text=text, reply_markup=reply_markup, disable_web_page_preview=True)
+
+# ==========================================
+# CALLBACK HANDLERS (Help, About, Home, Close)
+# ==========================================
+@app.on_callback_query(filters.regex("^help_menu$"))
+async def help_callback(client: Client, callback_query: CallbackQuery):
     await callback_query.answer()
-    await callback_query.message.reply_text(help_text)
+    await send_or_edit_panel(callback_query, build_help_text(), panel_nav_keyboard())
+
+@app.on_callback_query(filters.regex("^about_menu$"))
+async def about_callback(client: Client, callback_query: CallbackQuery):
+    await callback_query.answer()
+    await send_or_edit_panel(callback_query, build_about_text(), panel_nav_keyboard())
+
+@app.on_callback_query(filters.regex("^home_menu$"))
+async def home_callback(client: Client, callback_query: CallbackQuery):
+    user = callback_query.from_user
+    owner_meta = ""
+    if user.id == OWNER_ID:
+        total_users, total_blocked, ai_on = await asyncio.gather(
+            users_col.count_documents({}),
+            blocked_col.count_documents({}),
+            is_ai_enabled(),
+        )
+        ai_status = "🟢 ON" if ai_on else "🔴 OFF"
+        owner_meta = f"AI Auto-Reply: {ai_status} • Users: {total_users} • Blocked: {total_blocked}"
+
+    text = build_start_text(user, owner_meta=owner_meta)
+    await callback_query.answer()
+    await send_or_edit_panel(callback_query, text, start_keyboard())
+
+@app.on_callback_query(filters.regex("^close_menu$"))
+async def close_callback(client: Client, callback_query: CallbackQuery):
+    await callback_query.answer()
+    try:
+        await callback_query.message.delete()
+    except Exception:
+        pass
 
 # ==========================================
 # /START COMMAND
@@ -140,6 +228,7 @@ async def start_handler(client: Client, message: Message):
 
     asyncio.create_task(save_user(user))
 
+    owner_meta = ""
     if user.id == OWNER_ID:
         total_users, total_blocked, ai_on = await asyncio.gather(
             users_col.count_documents({}),
@@ -147,23 +236,23 @@ async def start_handler(client: Client, message: Message):
             is_ai_enabled(),
         )
         ai_status = "🟢 ON" if ai_on else "🔴 OFF"
-        await message.reply_text(
-            f"<blockquote>"
-            f"<b>Hey {format_user_greeting(user)}, welcome!</b>\n"
-            f"AI Auto-Reply: <b>{ai_status}</b> • Users: <code>{total_users}</code> • Blocked: <code>{total_blocked}</code>\n"
-            f"Commands: <code>/ai on|off</code> • <code>/block</code> • <code>/unblock &lt;id&gt;</code> • <code>/stats</code> • <code>/broadcast</code>"
-            f"</blockquote>",
-            reply_markup=start_keyboard(),
-        )
-        return
+        owner_meta = f"AI Auto-Reply: {ai_status} • Users: {total_users} • Blocked: {total_blocked}"
 
-    welcome_text = (
-        f"<blockquote>"
-        f"<b>Hey {format_user_greeting(user)}, welcome!</b>\n"
-        f"Drop your message below and it will be sent directly to the owner."
-        f"</blockquote>"
-    )
-    await message.reply_text(welcome_text, reply_markup=start_keyboard())
+    welcome_text = build_start_text(user, owner_meta=owner_meta)
+    keyboard = start_keyboard()
+
+    if has_start_image():
+        try:
+            await message.reply_photo(
+                photo=START_IMAGE_URL.strip(),
+                caption=welcome_text,
+                reply_markup=keyboard,
+            )
+            return
+        except Exception as e:
+            logger.warning(f"Failed to send start image, falling back to text: {e}")
+
+    await message.reply_text(welcome_text, reply_markup=keyboard, disable_web_page_preview=True)
 
 # ==========================================
 # ADMIN COMMANDS
@@ -172,12 +261,12 @@ async def start_handler(client: Client, message: Message):
 async def toggle_ai(client: Client, message: Message):
     if len(message.command) < 2 or message.command[1].lower() not in ("on", "off"):
         current = "ON" if await is_ai_enabled() else "OFF"
-        await message.reply_text(f"<blockquote>Usage: <code>/ai on</code> or <code>/ai off</code> (Current: <b>{current}</b>)</blockquote>")
+        await message.reply_text(f"<blockquote><b>Usage: <code>/ai on</code> or <code>/ai off</code> (Current: {current})</b></blockquote>")
         return
 
     state = message.command[1].lower() == "on"
     await settings_col.update_one({"key": "ai_mode"}, {"$set": {"value": state}}, upsert=True)
-    await message.reply_text(f"<blockquote>AI Auto-Responder is now <b>{'ON' if state else 'OFF'}</b>.</blockquote>")
+    await message.reply_text(f"<blockquote><b>AI Auto-Responder is now {'ON' if state else 'OFF'}.</b></blockquote>")
 
 @app.on_message(filters.command("block") & filters.user(OWNER_ID) & filters.private)
 async def block_user(client: Client, message: Message):
@@ -194,7 +283,7 @@ async def block_user(client: Client, message: Message):
             pass
 
     if not target_user_id:
-        await message.reply_text("<blockquote>Reply to a forwarded message with <code>/block</code> or pass a User ID.</blockquote>")
+        await message.reply_text("<blockquote><b>Reply to a forwarded message with <code>/block</code> or pass a User ID.</b></blockquote>")
         return
 
     await blocked_col.update_one(
@@ -202,22 +291,22 @@ async def block_user(client: Client, message: Message):
         {"$set": {"blocked_at": datetime.now(IST).isoformat()}},
         upsert=True,
     )
-    await message.reply_text(f"<blockquote>Blocked user <code>{target_user_id}</code>.</blockquote>")
+    await message.reply_text(f"<blockquote><b>Blocked user <code>{target_user_id}</code>.</b></blockquote>")
 
 @app.on_message(filters.command("unblock") & filters.user(OWNER_ID) & filters.private)
 async def unblock_user(client: Client, message: Message):
     if len(message.command) < 2:
-        await message.reply_text("<blockquote>Usage: <code>/unblock &lt;user_id&gt;</code></blockquote>")
+        await message.reply_text("<blockquote><b>Usage: <code>/unblock &lt;user_id&gt;</code></b></blockquote>")
         return
     try:
         target_user_id = int(message.command[1])
     except ValueError:
-        await message.reply_text("<blockquote>Invalid User ID.</blockquote>")
+        await message.reply_text("<blockquote><b>Invalid User ID.</b></blockquote>")
         return
 
     res = await blocked_col.delete_one({"user_id": target_user_id})
     msg = f"Unblocked user <code>{target_user_id}</code>." if res.deleted_count else "User was not blocked."
-    await message.reply_text(f"<blockquote>{msg}</blockquote>")
+    await message.reply_text(f"<blockquote><b>{msg}</b></blockquote>")
 
 @app.on_message(filters.command("stats") & filters.user(OWNER_ID) & filters.private)
 async def stats_handler(client: Client, message: Message):
@@ -230,19 +319,19 @@ async def stats_handler(client: Client, message: Message):
     await message.reply_text(
         f"<blockquote>"
         f"<b>Stats</b>\n"
-        f"Users: <code>{total_users}</code> | Blocked: <code>{total_blocked}</code>\n"
-        f"Mapped Msgs: <code>{total_msgs}</code> | AI: <code>{'ON' if ai_on else 'OFF'}</code>\n"
-        f"Time: <code>{get_ist_time()}</code>"
+        f"<b>Users: <code>{total_users}</code> | Blocked: <code>{total_blocked}</code></b>\n"
+        f"<b>Mapped Msgs: <code>{total_msgs}</code> | AI: <code>{'ON' if ai_on else 'OFF'}</code></b>\n"
+        f"<b>Time: <code>{get_ist_time()}</code></b>"
         f"</blockquote>"
     )
 
 @app.on_message(filters.command("broadcast") & filters.user(OWNER_ID) & filters.private)
 async def broadcast_handler(client: Client, message: Message):
     if not message.reply_to_message:
-        await message.reply_text("<blockquote>Reply to a message with <code>/broadcast</code>.</blockquote>")
+        await message.reply_text("<blockquote><b>Reply to a message with <code>/broadcast</code>.</b></blockquote>")
         return
 
-    status_msg = await message.reply_text("<blockquote>Broadcasting...</blockquote>")
+    status_msg = await message.reply_text("<blockquote><b>Broadcasting...</b></blockquote>")
     blocked_ids = {doc["user_id"] async for doc in blocked_col.find({}, {"user_id": 1})}
     sent, failed = 0, 0
 
@@ -258,7 +347,7 @@ async def broadcast_handler(client: Client, message: Message):
             failed += 1
 
     await status_msg.edit_text(
-        f"<blockquote>Broadcast done — Sent: <code>{sent}</code> | Failed: <code>{failed}</code></blockquote>"
+        f"<blockquote><b>Broadcast done — Sent: <code>{sent}</code> | Failed: <code>{failed}</code></b></blockquote>"
     )
 
 # ==========================================
@@ -306,7 +395,7 @@ async def user_to_owner(client: Client, message: Message):
                 contents=prompt,
             )
             if response.text:
-                await message.reply_text(f"<blockquote>{response.text.strip()}</blockquote>")
+                await message.reply_text(f"<blockquote><b>{response.text.strip()}</b></blockquote>")
         except Exception as e:
             logger.error(f"Gemini error: {e}")
 
@@ -320,7 +409,7 @@ async def owner_to_user(client: Client, message: Message):
 
     record = await msg_map_col.find_one({"owner_msg_id": message.reply_to_message.id})
     if not record:
-        await message.reply_text("<blockquote>Reply to a forwarded user message or its header.</blockquote>")
+        await message.reply_text("<blockquote><b>Reply to a forwarded user message or its header.</b></blockquote>")
         return
 
     target_user_id = record["user_id"]
@@ -339,9 +428,9 @@ async def owner_to_user(client: Client, message: Message):
                 reply_to_message_id=original_user_msg_id,
             )
     except UserIsBlocked:
-        await message.reply_text("<blockquote>User blocked the bot.</blockquote>")
+        await message.reply_text("<blockquote><b>User blocked the bot.</b></blockquote>")
     except Exception as e:
-        await message.reply_text(f"<blockquote>Error: <code>{e}</code></blockquote>")
+        await message.reply_text(f"<blockquote><b>Error: <code>{e}</code></b></blockquote>")
 
 # ==========================================
 # STARTUP ENTRYPOINT
