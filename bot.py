@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
@@ -12,10 +13,8 @@ from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
-    InputMediaPhoto,
 )
-from pyrogram.errors import UserIsBlocked
-from google import genai
+from pyrogram.errors import UserIsBlocked, UserNotParticipant, ChatAdminRequired, PeerIdInvalid
 
 # ==========================================
 # CONFIGURATION (Set in Render Env Vars)
@@ -25,12 +24,11 @@ API_HASH = os.environ.get("API_HASH", "your_api_hash_here")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token_here")
 OWNER_ID = int(os.environ.get("OWNER_ID", "123456789"))
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majority")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "your_gemini_api_key_here")
 
 # Add your start image URL here or via START_IMAGE_URL env var
 START_IMAGE_URL = os.environ.get("START_IMAGE_URL", "")
 BOT_NAME = os.environ.get("BOT_NAME", "Aero Contact Relay")
-BOT_VERSION = os.environ.get("BOT_VERSION", "v3.2")
+BOT_VERSION = os.environ.get("BOT_VERSION", "v3.3")
 
 UPDATES_URL = os.environ.get("UPDATES_CHANNEL_URL", "https://t.me/Aero_Unity")
 REPO_URL = os.environ.get("REPO_URL", "https://t.me/Aero_Unity")
@@ -40,21 +38,20 @@ PYTHON_URL = os.environ.get("PYTHON_URL", "https://www.python.org")
 PORT = int(os.environ.get("PORT", 8080))
 
 IST = timezone(timedelta(hours=5, minutes=30))
+BOT_START_TIME = time.time()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# DATABASE & GEMINI SETUP
+# DATABASE SETUP
 # ==========================================
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client["ContactRelayBot"]
 users_col = db["users"]
 msg_map_col = db["message_map"]
 blocked_col = db["blocked_users"]
-settings_col = db["settings"]
-
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY and "your_" not in GEMINI_API_KEY else None
+fsub_col = db["forcesub_channels"]
 
 # ==========================================
 # FLASK KEEP-ALIVE SERVER (For Render 24/7)
@@ -86,6 +83,21 @@ app = Client(
 def get_ist_time() -> str:
     return datetime.now(IST).strftime("%I:%M %p • %d %b")
 
+def get_bot_uptime() -> str:
+    elapsed = int(time.time() - BOT_START_TIME)
+    days, rem = divmod(elapsed, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
 def format_user_greeting(user) -> str:
     if user.username:
         return f"@{user.username}"
@@ -93,6 +105,18 @@ def format_user_greeting(user) -> str:
 
 def has_start_image() -> bool:
     return bool(START_IMAGE_URL and START_IMAGE_URL.strip().startswith(("http://", "https://")))
+
+def normalize_chat_target(raw_target: str):
+    cleaned = raw_target.strip()
+    if cleaned.startswith("https://t.me/"):
+        cleaned = cleaned.replace("https://t.me/", "").split("/")[0]
+    if cleaned.startswith("http://t.me/"):
+        cleaned = cleaned.replace("http://t.me/", "").split("/")[0]
+    if cleaned.lstrip("-").isdigit():
+        return int(cleaned)
+    if not cleaned.startswith("@"):
+        cleaned = f"@{cleaned}"
+    return cleaned
 
 async def save_user(user):
     await users_col.update_one(
@@ -110,9 +134,56 @@ async def save_user(user):
         upsert=True,
     )
 
-async def is_ai_enabled() -> bool:
-    setting = await settings_col.find_one({"key": "ai_mode"})
-    return bool(setting and setting.get("value", False))
+async def get_missing_fsub_channels(client: Client, user_id: int) -> list[dict]:
+    if user_id == OWNER_ID:
+        return []
+
+    channels = [doc async for doc in fsub_col.find({})]
+    if not channels:
+        return []
+
+    missing = []
+    for ch in channels:
+        chat_target = ch.get("chat_id")
+        try:
+            member = await client.get_chat_member(chat_target, user_id)
+            if member.status in (
+                enums.ChatMemberStatus.BANNED,
+                enums.ChatMemberStatus.LEFT,
+                enums.ChatMemberStatus.RESTRICTED,
+            ):
+                missing.append(ch)
+        except UserNotParticipant:
+            missing.append(ch)
+        except (ChatAdminRequired, PeerIdInvalid) as e:
+            logger.warning(f"ForceSub check warning for {chat_target}: {e}")
+        except Exception as e:
+            logger.warning(f"ForceSub error for {chat_target}: {e}")
+    return missing
+
+def build_fsub_markup(missing_channels: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for idx, ch in enumerate(missing_channels, start=1):
+        title = ch.get("title") or f"Channel {idx}"
+        invite_link = ch.get("invite_link") or UPDATES_URL
+        row.append(InlineKeyboardButton(f"📢 Join {title}", url=invite_link))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔄 Try Again", callback_data="recheck_fsub")])
+    return InlineKeyboardMarkup(rows)
+
+def build_fsub_text(missing_channels: list[dict]) -> str:
+    lines = ["<blockquote><b>Please join the required channel(s) below to continue:</b>"]
+    for idx, ch in enumerate(missing_channels, start=1):
+        title = ch.get("title") or f"Channel {idx}"
+        link = ch.get("invite_link") or UPDATES_URL
+        lines.append(f"<b>{idx}. <a href='{link}'>{title}</a></b>")
+    lines.append("</blockquote>")
+    return "\n".join(lines)
 
 def start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -140,7 +211,7 @@ def build_start_text(user, owner_meta: str = "") -> str:
             f"<blockquote>"
             f"<b>Hey {greeting}, welcome!</b>\n\n"
             f"<b>{owner_meta}</b>\n"
-            f"<b>Commands: /ai on|off • /block • /unblock &lt;id&gt; • /stats • /broadcast</b>"
+            f"<b>Commands: /addforcesub • /removeforcesub • /forcesublist • /botuptime • /block • /unblock • /stats • /broadcast</b>"
             f"</blockquote>"
         )
     return (
@@ -180,7 +251,7 @@ async def send_or_edit_panel(callback_query: CallbackQuery, text: str, reply_mar
         await msg.edit_text(text=text, reply_markup=reply_markup, disable_web_page_preview=True)
 
 # ==========================================
-# CALLBACK HANDLERS (Help, About, Home, Close)
+# CALLBACK HANDLERS (Help, About, Home, Close, ForceSub)
 # ==========================================
 @app.on_callback_query(filters.regex("^help_menu$"))
 async def help_callback(client: Client, callback_query: CallbackQuery):
@@ -197,13 +268,12 @@ async def home_callback(client: Client, callback_query: CallbackQuery):
     user = callback_query.from_user
     owner_meta = ""
     if user.id == OWNER_ID:
-        total_users, total_blocked, ai_on = await asyncio.gather(
+        total_users, total_blocked, total_fsub = await asyncio.gather(
             users_col.count_documents({}),
             blocked_col.count_documents({}),
-            is_ai_enabled(),
+            fsub_col.count_documents({}),
         )
-        ai_status = "🟢 ON" if ai_on else "🔴 OFF"
-        owner_meta = f"AI Auto-Reply: {ai_status} • Users: {total_users} • Blocked: {total_blocked}"
+        owner_meta = f"Uptime: {get_bot_uptime()} • Users: {total_users} • Blocked: {total_blocked} • FSub: {total_fsub}"
 
     text = build_start_text(user, owner_meta=owner_meta)
     await callback_query.answer()
@@ -217,6 +287,24 @@ async def close_callback(client: Client, callback_query: CallbackQuery):
     except Exception:
         pass
 
+@app.on_callback_query(filters.regex("^recheck_fsub$"))
+async def recheck_fsub_callback(client: Client, callback_query: CallbackQuery):
+    user = callback_query.from_user
+    if await blocked_col.find_one({"user_id": user.id}):
+        await callback_query.answer("Access denied.", show_alert=True)
+        return
+
+    missing = await get_missing_fsub_channels(client, user.id)
+    if missing:
+        await callback_query.answer("You haven't joined all required channels yet.", show_alert=True)
+        await send_or_edit_panel(callback_query, build_fsub_text(missing), build_fsub_markup(missing))
+        return
+
+    await callback_query.answer("Verified! Welcome.", show_alert=False)
+    asyncio.create_task(save_user(user))
+    welcome_text = build_start_text(user)
+    await send_or_edit_panel(callback_query, welcome_text, start_keyboard())
+
 # ==========================================
 # /START COMMAND
 # ==========================================
@@ -226,17 +314,25 @@ async def start_handler(client: Client, message: Message):
     if await blocked_col.find_one({"user_id": user.id}):
         return
 
+    missing = await get_missing_fsub_channels(client, user.id)
+    if missing:
+        await message.reply_text(
+            build_fsub_text(missing),
+            reply_markup=build_fsub_markup(missing),
+            disable_web_page_preview=True,
+        )
+        return
+
     asyncio.create_task(save_user(user))
 
     owner_meta = ""
     if user.id == OWNER_ID:
-        total_users, total_blocked, ai_on = await asyncio.gather(
+        total_users, total_blocked, total_fsub = await asyncio.gather(
             users_col.count_documents({}),
             blocked_col.count_documents({}),
-            is_ai_enabled(),
+            fsub_col.count_documents({}),
         )
-        ai_status = "🟢 ON" if ai_on else "🔴 OFF"
-        owner_meta = f"AI Auto-Reply: {ai_status} • Users: {total_users} • Blocked: {total_blocked}"
+        owner_meta = f"Uptime: {get_bot_uptime()} • Users: {total_users} • Blocked: {total_blocked} • FSub: {total_fsub}"
 
     welcome_text = build_start_text(user, owner_meta=owner_meta)
     keyboard = start_keyboard()
@@ -255,19 +351,96 @@ async def start_handler(client: Client, message: Message):
     await message.reply_text(welcome_text, reply_markup=keyboard, disable_web_page_preview=True)
 
 # ==========================================
-# ADMIN COMMANDS
+# FORCESUB & UPTIME COMMANDS (OWNER ONLY)
 # ==========================================
-@app.on_message(filters.command("ai") & filters.user(OWNER_ID) & filters.private)
-async def toggle_ai(client: Client, message: Message):
-    if len(message.command) < 2 or message.command[1].lower() not in ("on", "off"):
-        current = "ON" if await is_ai_enabled() else "OFF"
-        await message.reply_text(f"<blockquote><b>Usage: <code>/ai on</code> or <code>/ai off</code> (Current: {current})</b></blockquote>")
+@app.on_message(filters.command("addforcesub") & filters.user(OWNER_ID) & filters.private)
+async def add_forcesub_handler(client: Client, message: Message):
+    if len(message.command) < 2:
+        await message.reply_text("<blockquote><b>Usage: <code>/addforcesub &lt;channel_id_or_@username&gt;</code></b></blockquote>")
         return
 
-    state = message.command[1].lower() == "on"
-    await settings_col.update_one({"key": "ai_mode"}, {"$set": {"value": state}}, upsert=True)
-    await message.reply_text(f"<blockquote><b>AI Auto-Responder is now {'ON' if state else 'OFF'}.</b></blockquote>")
+    target = normalize_chat_target(message.command[1])
+    try:
+        chat = await client.get_chat(target)
+        invite_link = chat.invite_link
+        if not invite_link:
+            if chat.username:
+                invite_link = f"https://t.me/{chat.username}"
+            else:
+                invite_link = await client.export_chat_invite_link(chat.id)
 
+        title = chat.title or str(chat.id)
+        await fsub_col.update_one(
+            {"chat_id": chat.id},
+            {
+                "$set": {
+                    "chat_id": chat.id,
+                    "title": title,
+                    "username": chat.username,
+                    "invite_link": invite_link,
+                    "added_at": datetime.now(IST).isoformat(),
+                }
+            },
+            upsert=True,
+        )
+        await message.reply_text(
+            f"<blockquote><b>Added ForceSub channel: <a href='{invite_link}'>{title}</a> (<code>{chat.id}</code>)</b></blockquote>",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        await message.reply_text(
+            f"<blockquote><b>Failed to add channel. Make sure the bot is an admin in the channel.\nError: <code>{e}</code></b></blockquote>"
+        )
+
+@app.on_message(filters.command("removeforcesub") & filters.user(OWNER_ID) & filters.private)
+async def remove_forcesub_handler(client: Client, message: Message):
+    if len(message.command) < 2:
+        await message.reply_text("<blockquote><b>Usage: <code>/removeforcesub &lt;channel_id_or_@username&gt;</code></b></blockquote>")
+        return
+
+    raw = message.command[1].strip()
+    target = normalize_chat_target(raw)
+
+    query = {"$or": [{"chat_id": target}, {"username": raw.lstrip("@")}]}
+    if isinstance(target, int):
+        query = {"chat_id": target}
+
+    res = await fsub_col.delete_one(query)
+    if res.deleted_count:
+        await message.reply_text(f"<blockquote><b>Removed <code>{raw}</code> from ForceSub list.</b></blockquote>")
+    else:
+        await message.reply_text(f"<blockquote><b>Channel <code>{raw}</code> was not found in ForceSub list.</b></blockquote>")
+
+@app.on_message(filters.command("forcesublist") & filters.user(OWNER_ID) & filters.private)
+async def forcesub_list_handler(client: Client, message: Message):
+    channels = [doc async for doc in fsub_col.find({})]
+    if not channels:
+        await message.reply_text("<blockquote><b>No ForceSub channels configured.</b></blockquote>")
+        return
+
+    lines = ["<blockquote><b>ForceSub Channels</b>"]
+    for idx, ch in enumerate(channels, start=1):
+        title = ch.get("title") or "Channel"
+        cid = ch.get("chat_id")
+        link = ch.get("invite_link") or UPDATES_URL
+        lines.append(f"<b>{idx}. <a href='{link}'>{title}</a> — <code>{cid}</code></b>")
+    lines.append("</blockquote>")
+    await message.reply_text("\n".join(lines), disable_web_page_preview=True)
+
+@app.on_message(filters.command("botuptime") & filters.user(OWNER_ID) & filters.private)
+async def bot_uptime_handler(client: Client, message: Message):
+    start_dt = datetime.fromtimestamp(BOT_START_TIME, tz=IST).strftime("%I:%M %p • %d %b %Y")
+    await message.reply_text(
+        f"<blockquote>"
+        f"<b>Bot Uptime: <code>{get_bot_uptime()}</code></b>\n"
+        f"<b>Started At: <code>{start_dt} IST</code></b>\n"
+        f"<b>Current Time: <code>{get_ist_time()} IST</code></b>"
+        f"</blockquote>"
+    )
+
+# ==========================================
+# OTHER ADMIN COMMANDS
+# ==========================================
 @app.on_message(filters.command("block") & filters.user(OWNER_ID) & filters.private)
 async def block_user(client: Client, message: Message):
     target_user_id = None
@@ -310,18 +483,18 @@ async def unblock_user(client: Client, message: Message):
 
 @app.on_message(filters.command("stats") & filters.user(OWNER_ID) & filters.private)
 async def stats_handler(client: Client, message: Message):
-    total_users, total_blocked, total_msgs, ai_on = await asyncio.gather(
+    total_users, total_blocked, total_msgs, total_fsub = await asyncio.gather(
         users_col.count_documents({}),
         blocked_col.count_documents({}),
         msg_map_col.count_documents({}),
-        is_ai_enabled(),
+        fsub_col.count_documents({}),
     )
     await message.reply_text(
         f"<blockquote>"
         f"<b>Stats</b>\n"
         f"<b>Users: <code>{total_users}</code> | Blocked: <code>{total_blocked}</code></b>\n"
-        f"<b>Mapped Msgs: <code>{total_msgs}</code> | AI: <code>{'ON' if ai_on else 'OFF'}</code></b>\n"
-        f"<b>Time: <code>{get_ist_time()}</code></b>"
+        f"<b>Mapped Msgs: <code>{total_msgs}</code> | FSub: <code>{total_fsub}</code></b>\n"
+        f"<b>Uptime: <code>{get_bot_uptime()}</code></b>"
         f"</blockquote>"
     )
 
@@ -359,6 +532,15 @@ async def user_to_owner(client: Client, message: Message):
     if await blocked_col.find_one({"user_id": user.id}):
         return
 
+    missing = await get_missing_fsub_channels(client, user.id)
+    if missing:
+        await message.reply_text(
+            build_fsub_text(missing),
+            reply_markup=build_fsub_markup(missing),
+            disable_web_page_preview=True,
+        )
+        return
+
     asyncio.create_task(save_user(user))
 
     user_tag = f"@{user.username}" if user.username else user.first_name
@@ -374,30 +556,12 @@ async def user_to_owner(client: Client, message: Message):
     header_msg = await client.send_message(chat_id=OWNER_ID, text=header_text)
     copied_msg = await message.copy(chat_id=OWNER_ID)
 
-    # Map both messages and confirm forwarding to user in parallel
     map_task = msg_map_col.insert_many([
         {"owner_msg_id": header_msg.id, "user_id": user.id, "user_msg_id": message.id},
         {"owner_msg_id": copied_msg.id, "user_id": user.id, "user_msg_id": message.id},
     ])
     ack_task = message.reply_text("Your message was forwarded to the owner.")
     await asyncio.gather(map_task, ack_task)
-
-    # Optional Gemini AI auto-reply when enabled
-    if await is_ai_enabled() and message.text and gemini_client:
-        try:
-            prompt = (
-                f"Reply briefly and helpfully in 1-2 sentences to {user.first_name}, who messaged: "
-                f"'{message.text}'. Let them know their message is with the owner."
-            )
-            response = await asyncio.to_thread(
-                gemini_client.models.generate_content,
-                model="gemini-2.5-flash",
-                contents=prompt,
-            )
-            if response.text:
-                await message.reply_text(f"<blockquote><b>{response.text.strip()}</b></blockquote>")
-        except Exception as e:
-            logger.error(f"Gemini error: {e}")
 
 # ==========================================
 # OWNER -> USER REPLY RELAY (Pure Message Only)
